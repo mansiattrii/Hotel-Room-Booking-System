@@ -15,6 +15,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
+    Index,
     MetaData,
     Numeric,
     SmallInteger,
@@ -121,6 +122,11 @@ class Booking(Base):
         CheckConstraint("guests > 0", name="guests_positive"),
         CheckConstraint("total_price >= 0", name="total_price_non_negative"),
         UniqueConstraint("user_id", "idempotency_key"),
+        Index(
+            "ix_bookings_held_expiry",
+            "hold_expires_at",
+            postgresql_where=text("status = 'held'"),
+        ),
         ExcludeConstraint(
             ("room_id", "="),
             (text("daterange(check_in, check_out, '[)')"), "&&"),
@@ -149,12 +155,19 @@ class Booking(Base):
 class Payment(Base):
     __tablename__ = "payments"
     __table_args__ = (
+        # Any number of failed attempts, but a booking can be paid for only once.
+        Index(
+            "uq_payments_one_success_per_booking",
+            "booking_id",
+            unique=True,
+            postgresql_where=text("status = 'succeeded'"),
+        ),
         CheckConstraint(_in_list("status", PAYMENT_STATUSES), name="status_valid"),
         CheckConstraint("amount >= 0", name="amount_non_negative"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
-    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), unique=True)
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"))
     amount: Mapped[Decimal] = mapped_column(Money)
     status: Mapped[str] = mapped_column(String(16))
     provider_ref: Mapped[str] = mapped_column(String(100))

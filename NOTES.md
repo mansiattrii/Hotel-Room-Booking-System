@@ -226,8 +226,10 @@ would be the better choice.
 ### Case-insensitive city search
 
 The filter is `lower(city) = lower(:city)`. A plain B-tree index on `city` can't serve that,
-because the indexed value is `city`, not `lower(city)`. It needs an expression index
-`ON hotels (lower(city))`. That goes in the Milestone 3 index migration.
+because the indexed value is `city`, not `lower(city)`; it would need an expression index
+`ON hotels (lower(city))`. In Milestone 3 I tested that index and the planner didn't use it:
+the hotels table is only a few pages, so a sequential scan is cheaper. Not added (see the
+Milestone 3 section on indexes).
 
 ### Seed script
 
@@ -286,3 +288,255 @@ inserting transaction to wait for the previous one. Ids are unique, not gapless.
 - **Why COPY in the seed script?** Fastest bulk load; no per-row statement overhead.
 - **Can a user make themselves admin at registration?** No: the request schema has no
   `role` field, so it's ignored (tested).
+---
+
+## Milestone 3: Availability and booking
+
+### What was built
+
+- `GET /hotels/{id}/availability` and `GET /availability?city=` (city-wide search, the
+  query the Milestone 4 benchmark measures).
+- `POST /bookings` (hold), `POST /bookings/{id}/confirm`, `POST /bookings/{id}/cancel`,
+  `GET /bookings/me`, `GET /bookings/{id}`.
+- `services/locking.py`: the three strategies, selected by `BOOKING_STRATEGY`.
+- `app/worker.py`: expires lapsed holds every `WORKER_INTERVAL_SECONDS`.
+- Migrations: `0002` (payment attempts), `0003` (one partial index for the worker).
+- `scripts/exclusion_toggle.py`: test-only removal of the exclusion constraint.
+- Tests: availability, the booking flow, idempotency, access rules, each strategy, real
+  concurrent races, the worker, the toggle.
+
+### The availability query
+
+```sql
+SELECT h.id, ..., rt.id, rt.name, rt.capacity, rt.base_price_per_night,
+       rt.base_price_per_night * :nights AS total_price,
+       array_agg(r.id ORDER BY r.room_number) AS room_ids
+FROM hotels h
+JOIN room_types rt ON rt.hotel_id = h.id
+JOIN rooms r       ON r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id
+WHERE h.id = :hotel_id                      -- or: lower(h.city) = lower(:city)
+  AND rt.capacity >= :guests
+  AND NOT EXISTS (
+        SELECT 1 FROM bookings b
+        WHERE b.room_id = r.id
+          AND b.status IN ('held', 'confirmed')
+          AND daterange(b.check_in, b.check_out, '[)') && daterange(:check_in, :check_out, '[)')
+          AND (b.status = 'confirmed' OR b.hold_expires_at > now())
+      )
+GROUP BY h.id, rt.id
+ORDER BY h.id, rt.base_price_per_night, rt.id
+```
+
+Reading it top to bottom:
+1. Join hotel → room types → rooms. The rooms join uses both `hotel_id` and
+   `room_type_id`, matching the composite foreign key.
+2. Keep room types big enough for the party.
+3. `NOT EXISTS`: drop a room if *any* active booking of it overlaps the requested stay.
+   `&&` is "ranges overlap"; with `[)` a stay ending on the 15th doesn't overlap one
+   starting on the 15th.
+4. The last condition treats a hold past its expiry as free even if the worker hasn't
+   marked it expired yet.
+5. Group the surviving rooms by room type, count them, and price the stay.
+
+**Why `NOT EXISTS`** and not `LEFT JOIN ... WHERE b.id IS NULL` or `NOT IN`: it says
+exactly "no matching row exists", PostgreSQL turns it into an anti-join that stops at the
+first match, and unlike `NOT IN` it isn't broken by NULLs.
+
+**Index used:** `ex_bookings_no_overlap`. The GiST index behind the exclusion constraint
+is on `(room_id, daterange(check_in, check_out, '[)'))` for active bookings, which is
+exactly the shape of the `NOT EXISTS` probe. The constraint's index does double duty.
+
+### Indexes (decided from EXPLAIN ANALYZE on the seeded data, not guessed)
+
+| Query | What served it | Decision |
+|---|---|---|
+| Availability `NOT EXISTS` | GiST index of the exclusion constraint | nothing new |
+| Overlap check / stale-hold expiry for one room | same GiST index | nothing new |
+| `GET /bookings/me` | `uq_bookings_user_id_idempotency_key` (`user_id` is its first column) | nothing new |
+| City filter on hotels | sequential scan; an index on `lower(city)` was tried and **not used** (the table is a few pages) | not added |
+| Rooms of a hotel by type | `uq_rooms_hotel_id_room_number`; an index on `(hotel_id, room_type_id)` was used but the difference was within run-to-run noise | not added |
+| Worker: lapsed holds | sequential scan of all bookings | **added** `ix_bookings_held_expiry ON bookings (hold_expires_at) WHERE status = 'held'` |
+
+The worker index is *partial*: only live holds are in it, so it stays tiny no matter how
+many bookings accumulate. During development the worker's query went from a full scan to
+a single index page on the seeded data.
+
+A plain index on `bookings.user_id` (the foreign key) isn't needed for the same reason:
+the composite unique index already starts with `user_id`.
+
+**Bug found while doing this:** the overlap check was slow because SQLAlchemy sent
+`room_id = $1::INTEGER` while the column is `BIGINT`. `btree_gist`'s operator class only
+covers `bigint = bigint`, so the GiST index could filter on dates but not on room, and
+scanned thousands of entries. Binding ids as `BigInteger` fixed it. (Plain B-tree indexes
+handle `bigint = integer` fine, which is why it's easy to miss.) EXPLAIN showed `room_id`
+in a `Filter` line instead of the `Index Cond` line; that's what to look for.
+
+### Why naive check-then-insert fails
+
+```
+time   Transaction A                       Transaction B
+ 1     SELECT overlap? -> none
+ 2                                         SELECT overlap? -> none
+ 3     INSERT booking; COMMIT
+ 4                                         INSERT booking; COMMIT   <- double booking
+```
+Each SELECT was correct when it ran. The decision was stale by the time of the INSERT.
+`test_naive_check_then_insert_double_books` plays out exactly this interleaving.
+
+### Why READ COMMITTED alone doesn't prevent it
+
+READ COMMITTED only promises you won't see *uncommitted* data. At step 2, A's booking isn't
+committed, so B correctly sees nothing. No isolation level makes B "wait to see" a row that
+doesn't exist yet; preventing this needs a lock, a constraint, or SERIALIZABLE.
+
+### The three strategies
+
+**Pessimistic** (`SELECT id FROM rooms WHERE id = :room_id FOR UPDATE`, then check, then
+insert): the room row acts as a mutex for that room. B blocks at the lock until A commits.
+It works *because* of READ COMMITTED: B's next statement takes a fresh snapshot and sees
+A's booking. Under REPEATABLE READ, B keeps the snapshot from before it waited, misses
+A's booking and double-books. `test_pessimistic_lock_relies_on_read_committed` shows both
+outcomes. The lock is only on that one room, so bookings for other rooms aren't affected.
+
+**Constraint** (default): just INSERT; the exclusion constraint checks overlaps
+atomically, using its index, at insert time. If B conflicts with A's uncommitted row,
+PostgreSQL makes B wait for A's outcome, then raises `exclusion_violation` (SQLSTATE
+23P01) if A committed. We map that to 409.
+
+**Optimistic** (not implemented, discussed): add a `version` column to rooms; read it,
+check availability, then `UPDATE rooms SET version = version + 1 WHERE id = :id AND
+version = :read_version` in the same transaction as the INSERT. If 0 rows updated,
+someone else booked meanwhile: retry or 409. No waiting, but under heavy contention for
+the same room most attempts fail and retry.
+
+| | Naive | Pessimistic | Optimistic | Constraint |
+|---|---|---|---|---|
+| Correct under concurrency | no | yes | yes | yes |
+| Contention behaviour | n/a | waits in line | fails and retries | waits for the conflicting row, then fails fast |
+| Guarantee lives in | nowhere | every code path that books | every code path that books | the database schema |
+| Survives a buggy new code path / manual SQL | no | no | no | **yes** |
+| Cost | none | lock held for the transaction | extra UPDATE, retries | GiST index maintenance on writes |
+| Portability | any DB | any DB | any DB | PostgreSQL-specific |
+
+**Why constraint is the default:** the guarantee holds for every writer (API, admin
+scripts, future services) without anyone having to remember to lock. Its index also serves
+the availability search. Pessimistic is the explained alternative: portable, and
+appropriate when the rule can't be expressed as a constraint (e.g. "at most N bookings
+per day across rooms").
+
+**SERIALIZABLE** would also prevent the anomaly (PostgreSQL detects the read/write
+dependency and aborts one transaction with SQLSTATE 40001), but every booking path then
+needs retry logic, and the abort rate rises under contention.
+
+**Test-only toggle:** with the constraint in place, naive and pessimistic would be
+protected by it and we couldn't tell whether the strategy itself works. So the
+pessimistic race test and the Milestone 4 experiment drop it on the test database first.
+That lives in `scripts/exclusion_toggle.py`, refuses any database not named `*_test` or
+when `APP_ENV=production`, and is never in the migration path. A test checks the
+restored constraint is identical to the migration's.
+
+### Isolation level
+
+All transactions run at **READ COMMITTED**, set explicitly on the engine (it's
+PostgreSQL's default, but the strategies depend on it, so it's stated, not assumed).
+Correctness comes from row locks and constraints, not from a stricter isolation level.
+
+### Holds and expiry
+
+- `POST /bookings` inserts `status = 'held'` with `hold_expires_at = now() + HOLD_MINUTES`.
+  The database clock is used for every time comparison, so app-server clock drift can't
+  extend or shorten a hold.
+- A hold blocks the room (it's in the exclusion constraint) until confirmed, cancelled or
+  expired.
+- **Why the booking path doesn't rely on the worker:** before checking availability, each
+  strategy runs `UPDATE bookings SET status = 'expired' WHERE room_id = :room AND status =
+  'held' AND hold_expires_at <= now() AND <overlaps the requested dates>` inside the same
+  transaction. If the worker is down, slow, or hasn't run yet, a lapsed hold still can't
+  block a new booking. The availability query likewise ignores lapsed holds. The worker
+  just keeps stored statuses tidy.
+- The worker uses `FOR UPDATE SKIP LOCKED`: it skips holds that a confirm or cancel has
+  locked right now (that transaction decides their fate), and several workers can run
+  without blocking each other. It works in batches so one sweep never holds thousands of
+  row locks.
+
+### Confirm, cancel and payments
+
+- Confirm and cancel start with `SELECT ... FROM bookings WHERE id = :id FOR UPDATE`.
+  That serialises confirm vs cancel vs worker for the same booking: e.g. a cancel can't
+  slip in between "payment succeeded" and "status = confirmed".
+- Confirm in one transaction: lock booking → if hold lapsed, mark expired and return 409 →
+  charge (mock) → insert payment row → set confirmed → commit.
+- Confirming an already confirmed booking returns it without charging again; cancelling
+  twice is a no-op. Retries are safe.
+- **Payment attempts (design change from the original spec):** the first schema had
+  `UNIQUE (booking_id)` on payments, so a declined card blocked any retry. Migration 0002
+  replaces it with a partial unique index, `UNIQUE (booking_id) WHERE status =
+  'succeeded'`: any number of failed attempts, at most one success. The database itself
+  guarantees no booking is paid twice, even with concurrent confirms. A declined payment
+  returns 402 and the hold stays active.
+- **Known trade-off:** a real payment provider call shouldn't happen while holding a row
+  lock (the call can take seconds; everything else touching that booking waits). The
+  production pattern is: mark the booking `payment_pending` and commit, call the provider
+  outside any transaction, then record the result in a second transaction, with a
+  reconciliation job for crashes in between. The mock is instant, so it's done inline here.
+
+### Idempotency keys
+
+A client that times out doesn't know whether its booking was created. Retrying could
+create a second hold. With `Idempotency-Key`:
+- First request: the key is stored on the booking (`UNIQUE (user_id, idempotency_key)`).
+- Same key, same body: the original booking is returned with the original 201, plus an
+  `Idempotent-Replayed: true` header. Nothing new is created.
+- Same key, different body: 422, because it's almost certainly a client bug.
+- Two concurrent requests with the same key: both may pass the lookup, but the unique
+  constraint lets only one insert win; the loser catches the violation and returns the
+  winner's booking.
+- Keys are per user, so two users can't collide.
+- Only successful creations are remembered. If the first attempt got 409, a retry runs
+  again (and may succeed if the room was freed).
+
+### Access rules
+
+Owner or admin can read, confirm or cancel a booking; anyone else gets 403.
+
+### Gotchas worth knowing
+
+- **`now()` is the transaction start time**, not the wall clock; stable within one
+  transaction. Tests rely on that.
+- **Session identity map:** after taking a row lock, the code reloads the row with
+  `populate_existing`, otherwise SQLAlchemy could hand back an older copy of the object
+  it already had in memory.
+- **Sequences have gaps:** a booking attempt that fails with 409 still consumes an id.
+
+### Alternatives rejected
+
+| Alternative | Why not |
+|---|---|
+| Naive as default | Double-books; exists only for the experiment. |
+| REPEATABLE READ for bookings | Breaks the pessimistic strategy (tested). |
+| SERIALIZABLE | Works, but every path needs retry logic; aborts under contention. |
+| Availability filtered in Python | Loads every booking into the app; the database does it with an index. |
+| Relying only on the worker for expiry | Correctness would depend on worker timing and uptime. |
+| `UNIQUE (booking_id)` on payments | A declined card blocks retries (replaced in 0002). |
+| Indexes added "just in case" | Each index slows writes and uses memory; added only with EXPLAIN evidence. |
+
+### Likely questions
+
+- **Walk me through the availability query.** See above: joins, capacity filter,
+  `NOT EXISTS` over overlapping active bookings, group by room type.
+- **Which index does it use?** The exclusion constraint's GiST index.
+- **Why does check-then-insert fail?** Two transactions both check before either inserts.
+- **Why doesn't READ COMMITTED prevent it?** It hides uncommitted rows; the conflicting row
+  isn't committed yet when the second check runs.
+- **Pessimistic vs constraint vs optimistic?** Table above.
+- **Why READ COMMITTED with the pessimistic strategy?** Fresh snapshot after the lock wait.
+  REPEATABLE READ would double-book (tested).
+- **What if the worker dies?** Nothing breaks: the booking path and availability query
+  ignore lapsed holds; statuses just stay stale until it's back.
+- **What does `SKIP LOCKED` do?** Skip rows another transaction has locked instead of
+  waiting; lets multiple workers share a queue.
+- **How do idempotency keys work?** Above.
+- **Can a booking be paid twice?** No: partial unique index on successful payments, plus
+  the row lock on the booking during confirm.
+- **What would you change for a real payment provider?** Don't call it while holding a
+  lock; use a pending state and reconciliation.

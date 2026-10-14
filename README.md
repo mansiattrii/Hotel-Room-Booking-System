@@ -35,6 +35,28 @@ python -m scripts.create_admin --email admin@example.com   # prompts for a passw
 Seeded users are `user1@example.com` … `userN@example.com` with the development password
 `password123`.
 
+## Worker
+
+Expires lapsed holds in the background (correctness doesn't depend on it; see NOTES.md):
+
+```powershell
+python -m app.worker
+```
+
+## Booking flow
+
+```text
+GET  /api/v1/availability?city=Goa&check_in=...&check_out=...&guests=2
+GET  /api/v1/hotels/{id}/availability?check_in=...&check_out=...&guests=2
+POST /api/v1/bookings                    (Idempotency-Key header required) -> held
+POST /api/v1/bookings/{id}/confirm       {"payment_token": "tok_visa"}     -> confirmed
+                                         ("tok_declined" simulates a declined card: 402)
+POST /api/v1/bookings/{id}/cancel
+```
+
+`BOOKING_STRATEGY` selects how double booking is prevented: `constraint` (default),
+`pessimistic`, or `naive` (demonstration only; it double-books under concurrency).
+
 ## Tests and lint
 
 ```powershell

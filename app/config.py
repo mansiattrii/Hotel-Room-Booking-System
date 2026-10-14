@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     jwt_algorithm: Literal["HS256"] = "HS256"
     access_token_expire_minutes: int = Field(default=60, gt=0)
 
+    booking_strategy: Literal["naive", "pessimistic", "constraint"] = "constraint"
+    hold_minutes: int = Field(default=10, gt=0)
+    max_stay_nights: int = Field(default=30, gt=0)
+    booking_horizon_days: int = Field(default=365, gt=0)
+    worker_interval_seconds: float = Field(default=30, gt=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

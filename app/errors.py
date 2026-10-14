@@ -39,6 +39,11 @@ class InvalidInputError(AppError):
         super().__init__(status.HTTP_422_UNPROCESSABLE_CONTENT, code, message)
 
 
+class PaymentDeclinedError(AppError):
+    def __init__(self, message: str, code: str = "payment_declined") -> None:
+        super().__init__(status.HTTP_402_PAYMENT_REQUIRED, code, message)
+
+
 class UnauthorizedError(AppError):
     def __init__(self, message: str, code: str = "unauthorized") -> None:
         super().__init__(

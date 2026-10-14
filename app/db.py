@@ -15,6 +15,9 @@ def build_engine(database_url: str) -> Engine:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_pre_ping=True,
+        # PostgreSQL's default, stated explicitly because the booking strategies depend on
+        # it: each statement sees data committed before it started. See NOTES.md.
+        isolation_level="READ COMMITTED",
         # Without a timeout, a port that accepts TCP but has no server behind it
         # (e.g. Docker's port proxy while the db container is stopped) blocks forever.
         connect_args={"connect_timeout": settings.db_connect_timeout_seconds},

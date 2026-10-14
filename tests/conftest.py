@@ -1,17 +1,20 @@
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import Connection, Engine, create_engine
+from sqlalchemy import Connection, Engine
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import build_engine, get_db
 from app.main import app
-from app.models import User
+from app.models import Hotel, Room, RoomType, User
 from app.security import create_access_token
 from app.services import users
 
@@ -35,7 +38,7 @@ def engine(test_database_url: str) -> Iterator[Engine]:
     command.downgrade(cfg, "base")
     command.upgrade(cfg, "head")
 
-    engine = create_engine(test_database_url)
+    engine = build_engine(test_database_url)
     yield engine
     engine.dispose()
 
@@ -98,3 +101,49 @@ def user_headers(make_user: Callable[..., User]) -> dict[str, str]:
 @pytest.fixture
 def admin_headers(make_user: Callable[..., User]) -> dict[str, str]:
     return bearer(make_user(role="admin"))
+
+
+def day(offset: int) -> date:
+    """A date relative to today (UTC, matching the API's validation)."""
+    return datetime.now(UTC).date() + timedelta(days=offset)
+
+
+@dataclass(frozen=True)
+class Catalog:
+    hotel_id: int
+    standard_type_id: int
+    suite_type_id: int
+    standard_rooms: tuple[int, int]
+    suite_room: int
+
+
+STANDARD_PRICE = Decimal("2500.00")
+SUITE_PRICE = Decimal("9000.00")
+
+
+@pytest.fixture
+def catalog(db_session: Session) -> Catalog:
+    """One hotel in Pune: two Standard rooms (2 guests) and one Suite (4 guests)."""
+    hotel = Hotel(name="Test Hotel", city="Pune", address="1 Test Road", star_rating=4)
+    db_session.add(hotel)
+    db_session.flush()
+    standard = RoomType(
+        hotel_id=hotel.id, name="Standard", capacity=2, base_price_per_night=STANDARD_PRICE
+    )
+    suite = RoomType(hotel_id=hotel.id, name="Suite", capacity=4, base_price_per_night=SUITE_PRICE)
+    db_session.add_all([standard, suite])
+    db_session.flush()
+    rooms = [
+        Room(hotel_id=hotel.id, room_type_id=standard.id, room_number="101"),
+        Room(hotel_id=hotel.id, room_type_id=standard.id, room_number="102"),
+        Room(hotel_id=hotel.id, room_type_id=suite.id, room_number="201"),
+    ]
+    db_session.add_all(rooms)
+    db_session.commit()
+    return Catalog(
+        hotel_id=hotel.id,
+        standard_type_id=standard.id,
+        suite_type_id=suite.id,
+        standard_rooms=(rooms[0].id, rooms[1].id),
+        suite_room=rooms[2].id,
+    )

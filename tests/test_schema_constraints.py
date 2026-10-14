@@ -319,15 +319,18 @@ def test_email_must_be_lowercase(connection: Connection) -> None:
     assert_violates(CHECK_VIOLATION, exc_info)
 
 
-def test_one_payment_per_booking(connection: Connection, ids: dict[str, int]) -> None:
+def test_many_failed_payments_but_only_one_success(
+    connection: Connection, ids: dict[str, int]
+) -> None:
     booking = insert_booking(
         connection, user_id=ids["user"], room_id=ids["room"], check_in=d(0), check_out=d(2)
     )
     insert_payment = text(
         "INSERT INTO payments (booking_id, amount, status, provider_ref) "
-        "VALUES (:b, 100.00, 'succeeded', 'mock-1')"
+        "VALUES (:b, 100.00, :s, 'mock')"
     )
-    connection.execute(insert_payment, {"b": booking})
+    for status in ("failed", "failed", "succeeded"):
+        connection.execute(insert_payment, {"b": booking, "s": status})
     with pytest.raises(IntegrityError) as exc_info, connection.begin_nested():
-        connection.execute(insert_payment, {"b": booking})
+        connection.execute(insert_payment, {"b": booking, "s": "succeeded"})
     assert_violates(UNIQUE_VIOLATION, exc_info)
