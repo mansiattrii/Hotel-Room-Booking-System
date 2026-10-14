@@ -8,11 +8,47 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 class AppError(Exception):
     """An error that maps directly to an HTTP response with the standard error body."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.headers = headers
+
+
+class NotFoundError(AppError):
+    def __init__(self, message: str, code: str = "not_found") -> None:
+        super().__init__(status.HTTP_404_NOT_FOUND, code, message)
+
+
+class ConflictError(AppError):
+    def __init__(self, message: str, code: str = "conflict") -> None:
+        super().__init__(status.HTTP_409_CONFLICT, code, message)
+
+
+class InvalidInputError(AppError):
+    """Well-formed input that refers to something invalid (e.g. another hotel's room type)."""
+
+    def __init__(self, message: str, code: str = "invalid_input") -> None:
+        super().__init__(status.HTTP_422_UNPROCESSABLE_CONTENT, code, message)
+
+
+class UnauthorizedError(AppError):
+    def __init__(self, message: str, code: str = "unauthorized") -> None:
+        super().__init__(
+            status.HTTP_401_UNAUTHORIZED, code, message, headers={"WWW-Authenticate": "Bearer"}
+        )
+
+
+class ForbiddenError(AppError):
+    def __init__(self, message: str, code: str = "forbidden") -> None:
+        super().__init__(status.HTTP_403_FORBIDDEN, code, message)
 
 
 def error_body(code: str, message: str, details: object | None = None) -> dict[str, object]:
@@ -33,7 +69,11 @@ _HTTP_CODES = {
 
 
 async def _app_error_handler(_: Request, exc: AppError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=error_body(exc.code, exc.message))
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_body(exc.code, exc.message),
+        headers=exc.headers,
+    )
 
 
 async def _http_error_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:

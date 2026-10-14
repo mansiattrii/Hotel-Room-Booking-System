@@ -154,3 +154,135 @@ way things fail, not the most convenient one.
   every test. That must never happen to development data.
 - **Why does `/health` check the database?** A process that is up but can't reach its
   database can't serve requests. The load balancer or orchestrator should know that.
+
+---
+
+## Milestone 2: Auth and catalog
+
+### What was built
+
+- `POST /auth/register`, `POST /auth/login` (returns a JWT), bearer-token dependency,
+  admin role check.
+- `GET /hotels` (city filter, pagination), `GET /hotels/{id}` (with room types).
+- Admin: `POST /admin/hotels`, `/admin/hotels/{id}/room-types`, `/admin/hotels/{id}/rooms`.
+- `scripts/create_admin.py`: registration always creates `user` accounts, so the first
+  admin is created from the command line.
+- `scripts/seed.py`: 200 hotels across 20 cities, 10,000 rooms, 200,000 bookings by default.
+- Tests for security helpers, auth, catalog endpoints and the seed generator.
+
+### How JWT auth works here
+
+A JWT is three base64 parts: `header.payload.signature`. The payload holds claims:
+`sub` (user id), `iat` (issued at), `exp` (expiry). The server signs header+payload with
+HMAC-SHA256 using `JWT_SECRET`. On each request it recomputes the signature; if anyone
+changed the payload (e.g. `sub`), the signature no longer matches. The payload is only
+encoded, not encrypted, so nothing secret goes in it.
+
+- **Algorithm pinned** (`algorithms=["HS256"]` when decoding). Otherwise an attacker could
+  send a token with `"alg": "none"` and no signature. There's a test for this.
+- **`exp`, `iat`, `sub` required**: a token without an expiry would be valid forever.
+- **Role read from the database, not the token.** If an admin is demoted, the next request
+  is already forbidden (tested). Cost: one primary-key lookup per request.
+- **Trade-off of stateless tokens:** a token can't be revoked before it expires. Mitigations
+  (not built): short expiry plus refresh tokens, or a denylist of token ids.
+
+### Passwords
+
+- **Argon2id** (`argon2-cffi`). Memory-hard, so GPU cracking is expensive; won the Password
+  Hashing Competition. The salt and parameters are stored inside the hash string.
+  bcrypt would also be fine but silently truncates passwords at 72 bytes. passlib, often
+  seen in tutorials, is unmaintained.
+- **Same error for unknown email and wrong password**, and an unknown email still runs a
+  full hash verification, so neither the message nor the response time reveals which
+  emails are registered.
+- **Max length 128**: hashing is deliberately expensive, so unbounded input is a DoS vector.
+- Emails are lowercased by the API; the DB `CHECK (email = lower(email))` backs that up.
+
+### Duplicates are detected by constraints, not by a SELECT first
+
+Register, add room type and add room just INSERT and translate the unique/foreign-key
+violation into 409 or 422, using the constraint name PostgreSQL reports. A "check first"
+SELECT would be the same check-then-act race as double booking: two concurrent requests
+can both see "not taken". This is the same idea as the booking exclusion constraint,
+applied to something simpler.
+
+### 401 vs 403
+
+401: we don't know who you are (missing, malformed, expired token). Sent with
+`WWW-Authenticate: Bearer`, as the HTTP spec requires. 403: we know who you are and
+you're not allowed.
+
+### Pagination
+
+Offset pagination (`LIMIT page_size OFFSET (page-1)*page_size`) with `ORDER BY id`.
+Without `ORDER BY`, PostgreSQL may return rows in any order, so a hotel could appear on
+two pages or none. The response includes `total` so clients can render page numbers.
+
+Trade-off: `OFFSET 10000` still reads and discards 10,000 rows, and rows inserted between
+requests shift pages. Keyset pagination (`WHERE id > :last_seen ORDER BY id LIMIT n`) fixes
+both but can't jump to page N. For 200 hotels offset is fine; for bookings history keyset
+would be the better choice.
+
+### Case-insensitive city search
+
+The filter is `lower(city) = lower(:city)`. A plain B-tree index on `city` can't serve that,
+because the indexed value is `city`, not `lower(city)`. It needs an expression index
+`ON hotels (lower(city))`. That goes in the Milestone 3 index migration.
+
+### Seed script
+
+- **COPY for bookings**: PostgreSQL's bulk-load protocol streams rows without per-statement
+  overhead. Hotels, room types, rooms and users use multi-row `INSERT ... RETURNING`
+  because their generated ids are needed for the foreign keys of the next table.
+- **Payments in one set-based statement**: `INSERT INTO payments SELECT ... FROM bookings
+  WHERE status = 'confirmed'`. One round trip instead of building rows in Python.
+- **Bookings never overlap**: per room, stays and gaps are laid out sequentially. If the
+  generator were wrong, the exclusion constraint would reject the COPY.
+- **Fixed random seed** (`--random-seed`, default 42): the same arguments give the same
+  data, tested by fingerprinting two runs. Dates are relative to today, so there is always
+  future inventory.
+- **Skewed distribution**: big cities get more hotels, cheap room types are more common.
+  Uniform data makes every query look the same and hides index effects.
+- **One shared password hash** for seeded users: Argon2 is slow on purpose.
+- `ANALYZE` afterwards so the query planner has statistics for the new data.
+- Refuses to run on a non-empty database unless `--reset` is given.
+
+### Testing approach
+
+Each test runs in a transaction that is rolled back. The session uses
+`join_transaction_mode="create_savepoint"`, so a service's `commit()` becomes a savepoint
+release: the service code is exercised unchanged and nothing persists between tests.
+
+### Why identity values have gaps
+
+Sequences (and identity columns) are not transactional: a rolled-back insert still
+consumes its id. This is deliberate. Making sequences transactional would force every
+inserting transaction to wait for the previous one. Ids are unique, not gapless.
+
+### Alternatives rejected
+
+| Alternative | Why not |
+|---|---|
+| Server-side sessions | Needs a session store; JWT keeps the API stateless. |
+| Role inside the JWT | Stale until expiry; demotion wouldn't take effect. |
+| OAuth2 password form (`application/x-www-form-urlencoded`) for login | JSON body is consistent with the rest of the API. |
+| bcrypt / passlib | 72-byte truncation / unmaintained. |
+| SELECT-then-INSERT for duplicates | Race condition. |
+| Keyset pagination for hotels | Can't jump to page N; offset is fine at this size. |
+
+### Likely questions
+
+- **What's in your JWT and how is it verified?** `sub`, `iat`, `exp`, HMAC-SHA256 signed;
+  verification recomputes the signature with the server secret and checks expiry.
+- **Can you log a user out?** Not server-side before expiry; that's the stateless trade-off.
+  Short-lived tokens plus refresh tokens or a denylist would fix it.
+- **Why Argon2?** Memory-hard, salted, current best practice.
+- **How do you prevent user enumeration on login?** Same message and same work for
+  unknown email and wrong password.
+- **Why not check if the email exists before inserting?** Race condition; the unique
+  constraint is the only reliable check.
+- **401 or 403?** Unauthenticated vs authenticated-but-not-allowed.
+- **Offset vs keyset pagination?** Above.
+- **Why COPY in the seed script?** Fastest bulk load; no per-row statement overhead.
+- **Can a user make themselves admin at registration?** No: the request schema has no
+  `role` field, so it's ignored (tested).

@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from app.config import get_settings
 from app.errors import register_error_handlers
 from app.logging_config import configure_logging
-from app.routers import health
+from app.routers import admin, auth, health, hotels
 
 API_PREFIX = "/api/v1"
 
@@ -15,7 +15,8 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Hotel Booking API", version="0.1.0")
     register_error_handlers(app)
-    app.include_router(health.router, prefix=API_PREFIX)
+    for router in (health.router, auth.router, hotels.router, admin.router):
+        app.include_router(router, prefix=API_PREFIX)
     return app
 
 

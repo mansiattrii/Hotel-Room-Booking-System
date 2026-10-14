@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 
 from sqlalchemy import Engine, create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
@@ -24,6 +25,12 @@ engine = build_engine(get_settings().database_url)
 
 # expire_on_commit=False lets routers serialise ORM objects after the service commits.
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def violated_constraint(exc: IntegrityError) -> str | None:
+    """Name of the constraint behind an IntegrityError, as reported by PostgreSQL."""
+    diag = getattr(exc.orig, "diag", None)
+    return getattr(diag, "constraint_name", None)
 
 
 def get_db() -> Iterator[Session]:
