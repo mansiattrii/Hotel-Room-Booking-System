@@ -1,0 +1,21 @@
+scenario,strategy,exclusion_constraint,run,requests,booked_201,conflict_409,other_errors,other_error_detail,total_seconds,latency_p50_ms,latency_p95_ms,active_bookings_in_db,overlapping_pairs
+naive (without constraint),naive,False,1,100,3,97,0,,2.126,1134.1,1929.2,3,3
+naive (without constraint),naive,False,2,100,2,98,0,,2.031,1026.1,1756.5,2,1
+naive (without constraint),naive,False,3,100,1,99,0,,2.262,1186.8,2089.9,1,0
+naive (without constraint),naive,False,4,100,1,99,0,,2.006,1032.7,1789.1,1,0
+naive (without constraint),naive,False,5,100,1,99,0,,2.283,1182.6,2081.9,1,0
+naive (with constraint),naive,True,1,100,1,99,0,,2.122,1109.8,1870.2,1,0
+naive (with constraint),naive,True,2,100,1,99,0,,2.089,1031.3,1893.9,1,0
+naive (with constraint),naive,True,3,100,1,99,0,,2.158,1121.5,1967.1,1,0
+naive (with constraint),naive,True,4,100,1,99,0,,2.200,1142.9,1928.7,1,0
+naive (with constraint),naive,True,5,100,1,99,0,,2.116,1078.9,1832.1,1,0
+pessimistic (without constraint),pessimistic,False,1,100,1,99,0,,2.240,1181.7,2068.8,1,0
+pessimistic (without constraint),pessimistic,False,2,100,1,99,0,,2.261,1218.6,2043.8,1,0
+pessimistic (without constraint),pessimistic,False,3,100,1,99,0,,2.229,1187.7,2061.2,1,0
+pessimistic (without constraint),pessimistic,False,4,100,1,99,0,,2.274,1236.4,2047.5,1,0
+pessimistic (without constraint),pessimistic,False,5,100,1,99,0,,2.121,1082.5,1888.8,1,0
+constraint (with constraint),constraint,True,1,100,1,99,0,,2.352,1176.0,2169.5,1,0
+constraint (with constraint),constraint,True,2,100,1,99,0,,2.352,1252.1,2169.8,1,0
+constraint (with constraint),constraint,True,3,100,1,99,0,,2.252,1201.9,2082.6,1,0
+constraint (with constraint),constraint,True,4,100,1,99,0,,2.330,1207.1,2085.4,1,0
+constraint (with constraint),constraint,True,5,100,1,99,0,,2.299,1234.9,2078.2,1,0

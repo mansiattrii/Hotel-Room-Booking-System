@@ -39,7 +39,8 @@ class UnsafeDatabaseError(RuntimeError):
     """Raised instead of altering a database that isn't a test database."""
 
 
-def _ensure_test_database(conn: Connection) -> None:
+def ensure_test_database(conn: Connection) -> None:
+    """Raise UnsafeDatabaseError unless conn points at a test database outside production."""
     if get_settings().app_env == "production":
         raise UnsafeDatabaseError("refusing to alter constraints when APP_ENV=production")
     name = conn.scalar(text("SELECT current_database()"))
@@ -59,7 +60,7 @@ def is_enabled(conn: Connection) -> bool:
 
 def disable(conn: Connection) -> None:
     """Drop the exclusion constraint (and its GiST index) from a test database."""
-    _ensure_test_database(conn)
+    ensure_test_database(conn)
     conn.execute(text(f"ALTER TABLE bookings DROP CONSTRAINT IF EXISTS {CONSTRAINT_NAME}"))
 
 
@@ -69,7 +70,7 @@ def enable(conn: Connection) -> None:
     Fails if overlapping active bookings exist, which is the point: the data must be
     cleaned up before the guarantee can be restored.
     """
-    _ensure_test_database(conn)
+    ensure_test_database(conn)
     if not is_enabled(conn):
         conn.execute(text(_ADD_CONSTRAINT))
 

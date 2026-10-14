@@ -1,0 +1,48 @@
+Sort  (cost=7059.15..7059.16 rows=1 width=141) (actual time=97.250..102.264 rows=2 loops=1)
+  Sort Key: rt.base_price_per_night, rt.id
+  Sort Method: quicksort  Memory: 25kB
+  Buffers: shared hit=5856
+  ->  GroupAggregate  (cost=1733.71..7059.14 rows=1 width=141) (actual time=97.221..102.237 rows=2 loops=1)
+        Group Key: rt.id
+        Buffers: shared hit=5856
+        ->  Incremental Sort  (cost=1733.71..7059.08 rows=9 width=89) (actual time=97.200..102.214 rows=10 loops=1)
+              Sort Key: rt.id, r.room_number
+              Presorted Key: rt.id
+              Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 26kB  Peak Memory: 26kB
+              Buffers: shared hit=5856
+              ->  Nested Loop  (cost=1068.08..7058.68 rows=9 width=89) (actual time=45.682..102.181 rows=10 loops=1)
+                    Join Filter: (rt.id = r.room_type_id)
+                    Rows Removed by Join Filter: 72
+                    Buffers: shared hit=5856
+                    ->  Index Scan using uq_room_types_hotel_id_id on room_types rt  (cost=0.28..11.84 rows=1 width=29) (actual time=0.023..0.038 rows=2 loops=1)
+                          Index Cond: (hotel_id = '113'::bigint)
+                          Filter: (capacity >= 4)
+                          Rows Removed by Filter: 2
+                          Buffers: shared hit=3
+                    ->  Hash Right Anti Join  (cost=1067.80..7046.43 rows=33 width=84) (actual time=48.543..51.060 rows=41 loops=2)
+                          Hash Cond: (b.room_id = r.id)
+                          Buffers: shared hit=5853
+                          ->  Gather  (cost=1000.00..6973.18 rows=1440 width=8) (actual time=2.505..50.168 rows=1965 loops=2)
+                                Workers Planned: 1
+                                Workers Launched: 1
+                                Buffers: shared hit=5846
+                                ->  Parallel Seq Scan on bookings b  (cost=0.00..5829.18 rows=847 width=8) (actual time=0.343..42.242 rows=982 loops=4)
+                                      Filter: (((status)::text = ANY ('{held,confirmed}'::text[])) AND (daterange(check_in, check_out, '[)'::text) && '[2026-10-19,2026-10-22)'::daterange) AND (((status)::text = 'confirmed'::text) OR (hold_expires_at > now())))
+                                      Rows Removed by Filter: 99018
+                                      Buffers: shared hit=5846
+                          ->  Hash  (cost=67.33..67.33 rows=38 width=84) (actual time=0.441..0.446 rows=48 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 14kB
+                                Buffers: shared hit=7
+                                ->  Nested Loop  (cost=0.29..67.33 rows=38 width=84) (actual time=0.066..0.095 rows=48 loops=1)
+                                      Buffers: shared hit=7
+                                      ->  Seq Scan on hotels h  (cost=0.00..5.50 rows=1 width=56) (actual time=0.029..0.038 rows=1 loops=1)
+                                            Filter: (id = '113'::bigint)
+                                            Rows Removed by Filter: 199
+                                            Buffers: shared hit=3
+                                      ->  Index Scan using uq_rooms_hotel_id_room_number on rooms r  (cost=0.29..61.45 rows=38 width=28) (actual time=0.033..0.047 rows=48 loops=1)
+                                            Index Cond: (hotel_id = '113'::bigint)
+                                            Buffers: shared hit=4
+Planning:
+  Buffers: shared hit=12
+Planning Time: 1.372 ms
+Execution Time: 102.521 ms

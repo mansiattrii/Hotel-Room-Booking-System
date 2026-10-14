@@ -1,0 +1,10 @@
+state,query,executions,p50_ms,p95_ms,max_ms,explain_execution_ms
+none,city_search,100,6600.129,35370.391,64133.153,2060.667
+none,hotel_search,100,47.394,89.785,107.716,102.521
+none,worker_sweep,100,22.109,24.848,27.587,31.273
+btree,city_search,100,7.577,13.881,25.385,2.054
+btree,hotel_search,100,4.070,5.212,5.873,0.727
+btree,worker_sweep,100,20.647,24.916,30.305,18.905
+production,city_search,100,6.621,11.556,196.636,0.688
+production,hotel_search,100,3.862,4.707,11.065,0.481
+production,worker_sweep,100,2.256,2.709,3.268,0.102

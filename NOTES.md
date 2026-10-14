@@ -540,3 +540,160 @@ Owner or admin can read, confirm or cancel a booking; anyone else gets 403.
   the row lock on the booking during confirm.
 - **What would you change for a real payment provider?** Don't call it while holding a
   lock; use a pending state and reconciliation.
+
+---
+
+## Milestone 4: Experiments
+
+### What was built
+
+- `scripts/concurrency_test.py`: 100 simultaneous bookings of one room through a real
+  uvicorn server, per strategy, then counts double bookings in SQL.
+- `scripts/benchmark_search.py`: times the city search, the hotel search and the worker's
+  expiry sweep in three index states, and saves the EXPLAIN ANALYZE plans.
+- `scripts/experiment_utils.py`: shared helpers (run metadata, percentiles, Markdown tables).
+- A fix for a pool deadlock the concurrency experiment uncovered, with a regression test
+  (`tests/test_db_pool.py`).
+- Results are committed in `results/`. Every number below is copied from those files.
+
+Both scripts run only against `hotel_booking_test` (they go through the same
+`ensure_test_database` guard as the exclusion toggle) and restore the production schema
+when they finish.
+
+### Experiment 1: 100 users book the same room at once
+
+**Setup:** 100 clients each send one `POST /bookings` for the same room and the same three
+nights. All 100 HTTP connections are opened first, then the requests are released at the
+same instant. One API process, DB pool 10 + overflow 10, READ COMMITTED. Five runs per
+scenario. After each run, SQL counts pairs of active bookings for the room whose dates
+overlap; anything above 0 is a double booking.
+
+| Scenario | 201 booked | Overlapping pairs | Runs that double-booked | Total time, median (s) |
+|---|---|---|---|---|
+| naive, constraint dropped | 1 to 3 | 0 to 3 | 2 of 5 | 2.126 |
+| naive, with constraint | 1 | 0 | 0 of 5 | 2.122 |
+| pessimistic, constraint dropped | 1 | 0 | 0 of 5 | 2.240 |
+| constraint (production) | 1 | 0 | 0 of 5 | 2.330 |
+
+Every other response was a 409; there were no other errors in any run.
+
+**What it shows:**
+- **Naive check-then-insert double-books under real load,** not just in the hand-built
+  interleaving of the Milestone 3 test. Run 1 created 3 bookings for the same nights.
+- **It doesn't happen every time** (2 of 5 runs). A race depends on timing, so a test that
+  passes once proves nothing. That's why the experiment repeats each scenario.
+- **The constraint rescues even the naive code** ("naive, with constraint": 1 booking every
+  run). The guarantee lives in the schema, so a buggy code path can't break it.
+- **Pessimistic locking alone is correct** with the constraint dropped: 1 booking every run.
+- **Speed differences between strategies are within noise.** Medians range from 2.12 to
+  2.33 s, and the per-run numbers overlap (see `results/concurrency.md`). Correctness, not
+  speed, is what separates them in this test.
+
+### The bug the experiment found: a connection pool deadlock
+
+**Symptom:** with more concurrent requests than pool connections, the API stalled until the
+pool's 30-second timeout and then returned 503s. Reproduced with plain `/health`: 100
+concurrent requests gave 60 × 200 and 40 × 503, median latency 30.4 s.
+
+**Cause:** FastAPI runs sync endpoints and sync dependencies on a thread pool of 40
+threads. The pool has 20 connections. Requests beyond those 20 took a thread and then
+blocked inside it, waiting for a connection. Once all 40 threads were blocked, the requests
+that *did* hold connections couldn't get a thread to finish and close their session, so
+they never handed the connection back. Nothing could make progress until the pool timeout
+fired, which is where the 503s and the 30 s latency came from.
+
+```
+40 threads:  [requests holding a connection, waiting for a thread to finish]
+           + [requests holding a thread, waiting for a connection]
+           -> each side waits for the other
+```
+
+**Fix:** `get_db` is now an async dependency. Before opening a session it waits on a
+semaphore sized to the pool's capacity (`pool_size + max_overflow`). Waiting happens in
+the event loop, which costs no thread, so a request only takes a thread once a connection
+is certain to be free. Closing the session runs in its own one-slot limiter, so handing a
+connection back never waits for a busy thread. The semaphore is created in the app's
+lifespan so it belongs to the event loop that serves requests.
+
+**After:** all 100 concurrent `/health` requests returned 200, the slowest in 0.605 s.
+
+**Regression test:** a pool of 2 connections and 60 concurrent requests, more than the 40
+threads plus the pool. On the old code 25 of 60 got 503; with the fix all 60 return 200.
+
+**Lesson:** acquiring one bounded resource (a connection) while holding another (a thread)
+can deadlock when both run out. Wait for the scarcer one before taking the other.
+
+### Experiment 2: search latency by index state
+
+**Setup:** the seeded dataset (5,000 users, 200 hotels, 10,000 rooms, 200,000 bookings),
+the application's exact SQL, 10 warm-up runs, then 100 timed runs per query and state. All
+states use the same seeded list of cities, hotels, dates and party sizes. Latency is
+measured from the Python client, so it includes the round trip to PostgreSQL in Docker.
+
+Index states on `bookings`:
+- **none:** no index (GiST constraint dropped, migration 0003 downgraded).
+- **btree:** a plain B-tree on `room_id` only. This is the obvious index anyone would add,
+  so it is a fairer comparison than "no index at all".
+- **production:** the GiST index behind the exclusion constraint, plus the partial
+  `ix_bookings_held_expiry` from 0003.
+
+| Query | none p50 / p95 (ms) | btree p50 / p95 (ms) | production p50 / p95 (ms) |
+|---|---|---|---|
+| City search | 6600.13 / 35370.39 | 7.58 / 13.88 | 6.62 / 11.56 |
+| Hotel search | 47.39 / 89.79 | 4.07 / 5.21 | 3.86 / 4.71 |
+| Worker expiry sweep | 22.11 / 24.85 | 20.65 / 24.92 | 2.26 / 2.71 |
+
+Index sizes: GiST `ex_bookings_no_overlap` 16 MB; the B-tree on `room_id` 1568 kB;
+`ix_bookings_held_expiry` 8192 bytes.
+
+**What it shows:**
+
+1. **No index is a disaster, and the plan shows why.** The planner estimated the joins
+   would produce 1 candidate room; there were 30. Expecting to probe bookings once, it
+   chose a nested loop with a parallel sequential scan of `bookings` on the inner side,
+   and then ran that scan once per candidate room (`loops=30` in
+   `results/explain/city_search_none.txt`). Median 6.6 s, p95 35 s.
+2. **For search, GiST and a plain B-tree perform about the same.** City search median
+   6.62 vs 7.58 ms; hotel search 3.86 vs 4.07 ms. Both plans probe `bookings` once per
+   candidate room with an index scan; only the index differs. GiST is also about ten
+   times larger (16 MB vs 1568 kB).
+3. **So the honest justification for GiST is the constraint, not speed.** The exclusion
+   constraint can't exist without a GiST index. Once it exists, the availability query
+   reuses it, so search needs no extra index. "GiST makes search faster" is not what this
+   data shows.
+4. **The partial index does its job.** The worker's sweep goes from a sequential scan of
+   all 200,000 bookings (20.65 ms with the B-tree, which doesn't help this query) to
+   2.26 ms. In EXPLAIN, server-side time drops from 18.905 ms to 0.102 ms. The index is
+   8 kB because it only holds held bookings.
+
+**Caveat:** the EXPLAIN times in `results/search_benchmark.md` are for the first parameter
+set only; the latency table is the one to quote.
+
+### Alternatives rejected
+
+| Alternative | Why not |
+|---|---|
+| Testing the race with the constraint in place | The constraint would hide whether the strategy itself works. |
+| One run per scenario | Naive double-booked in only 2 of 5 runs; one run could miss it. |
+| Comparing GiST only against "no index" | Any index beats no index; the B-tree state answers the real question. |
+| Raising the thread or DB pool size to fix the deadlock | Moves the limit instead of removing it; a larger burst deadlocks again. |
+| Switching the whole app to async SQLAlchemy | A much larger change; one async dependency fixes the cause. |
+
+### Likely questions
+
+- **Did you actually see a double booking?** Yes: naive with the constraint dropped
+  created up to 3 bookings for the same nights, in 2 of 5 runs.
+- **Why not every run?** It's a race; it only fails when two checks run before either
+  insert commits. That's why each scenario runs 5 times.
+- **Which strategy is fastest?** No measurable difference in this test: medians 2.12 to
+  2.33 s, with overlapping runs.
+- **Why spend 16 MB on GiST if a B-tree searches as fast?** The exclusion constraint
+  requires it, and the constraint is what guarantees no double booking. Search reuses it.
+- **Why was the no-index case so slow?** A row estimate of 1 against an actual 30 made the
+  planner pick a nested loop that scanned all bookings 30 times.
+- **Explain the deadlock.** Threads blocked waiting for connections while the connection
+  holders waited for threads. Fix: wait for a connection slot in the event loop first.
+- **Why does the regression test send 60 requests?** It must exceed the 40 worker threads
+  plus the pool; otherwise threads never run out.
+- **Why a partial index for the worker?** Its query only looks at held bookings, a tiny
+  fraction of the table. Indexing only those keeps the index at 8 kB.

@@ -1,0 +1,28 @@
+Update on bookings  (cost=6388.46..6396.49 rows=0 width=0) (actual time=20.362..20.367 rows=0 loops=1)
+  Buffers: shared hit=2888
+  ->  Nested Loop  (cost=6388.46..6396.49 rows=1 width=96) (actual time=19.525..19.529 rows=0 loops=1)
+        Buffers: shared hit=2888
+        ->  HashAggregate  (cost=6388.04..6388.05 rows=1 width=40) (actual time=19.523..19.526 rows=0 loops=1)
+              Group Key: "ANY_subquery".id
+              Batches: 1  Memory Usage: 24kB
+              Buffers: shared hit=2888
+              ->  Subquery Scan on "ANY_subquery"  (cost=6388.01..6388.04 rows=1 width=40) (actual time=19.518..19.520 rows=0 loops=1)
+                    Buffers: shared hit=2888
+                    ->  Limit  (cost=6388.01..6388.03 rows=1 width=22) (actual time=19.515..19.516 rows=0 loops=1)
+                          Buffers: shared hit=2888
+                          ->  LockRows  (cost=6388.01..6388.03 rows=1 width=22) (actual time=19.512..19.513 rows=0 loops=1)
+                                Buffers: shared hit=2888
+                                ->  Sort  (cost=6388.01..6388.02 rows=1 width=22) (actual time=19.510..19.510 rows=0 loops=1)
+                                      Sort Key: bookings_1.hold_expires_at
+                                      Sort Method: quicksort  Memory: 25kB
+                                      Buffers: shared hit=2888
+                                      ->  Seq Scan on bookings bookings_1  (cost=0.00..6388.00 rows=1 width=22) (actual time=19.459..19.459 rows=0 loops=1)
+                                            Filter: (((status)::text = 'held'::text) AND (hold_expires_at <= now()))
+                                            Rows Removed by Filter: 200000
+                                            Buffers: shared hit=2888
+        ->  Index Scan using pk_bookings on bookings  (cost=0.42..8.44 rows=1 width=14) (never executed)
+              Index Cond: (id = "ANY_subquery".id)
+Planning:
+  Buffers: shared hit=28
+Planning Time: 17.570 ms
+Execution Time: 31.273 ms

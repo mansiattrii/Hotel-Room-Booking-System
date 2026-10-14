@@ -234,7 +234,7 @@ def list_user_bookings(
     return list(bookings), total
 
 
-_EXPIRE_LAPSED_HOLDS = text(
+EXPIRE_LAPSED_HOLDS = text(
     """
     UPDATE bookings
     SET status = 'expired', updated_at = now()
@@ -258,7 +258,7 @@ def expire_lapsed_holds(db: Session, batch_size: int = 1000) -> int:
     """
     expired_total = 0
     while True:
-        expired = db.execute(_EXPIRE_LAPSED_HOLDS, {"batch_size": batch_size}).rowcount
+        expired = db.execute(EXPIRE_LAPSED_HOLDS, {"batch_size": batch_size}).rowcount
         db.commit()
         expired_total += expired
         if expired < batch_size:

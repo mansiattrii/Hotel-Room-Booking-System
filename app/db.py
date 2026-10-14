@@ -1,5 +1,7 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 
+import anyio
+from fastapi import Request
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -36,7 +38,24 @@ def violated_constraint(exc: IntegrityError) -> str | None:
     return getattr(diag, "constraint_name", None)
 
 
-def get_db() -> Iterator[Session]:
-    """FastAPI dependency yielding one session per request."""
-    with SessionLocal() as session:
-        yield session
+def pool_capacity() -> int:
+    """Connections the app's pool can hand out at once."""
+    settings = get_settings()
+    return settings.db_pool_size + settings.db_max_overflow
+
+
+async def get_db(request: Request) -> AsyncIterator[Session]:
+    """FastAPI dependency yielding one session per request.
+
+    A request only gets a session once a pool connection is certain to be free, so waiting
+    happens here in the event loop rather than in a worker thread blocked on the pool.
+    Threads blocked on the pool can deadlock the app (NOTES.md, Milestone 4).
+    """
+    async with request.app.state.db_session_slots:
+        session = request.app.state.session_factory()
+        try:
+            yield session
+        finally:
+            # Closing hands the connection back to the pool (a ROLLBACK round trip). A
+            # private limiter lets it run even when every worker thread is busy.
+            await anyio.to_thread.run_sync(session.close, limiter=anyio.CapacityLimiter(1))

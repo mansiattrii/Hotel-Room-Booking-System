@@ -1,0 +1,51 @@
+Incremental Sort  (cost=5541.47..7053.21 rows=2 width=141) (actual time=2050.137..2060.171 rows=4 loops=1)
+  Sort Key: h.id, rt.base_price_per_night, rt.id
+  Presorted Key: h.id
+  Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 25kB  Peak Memory: 25kB
+  Buffers: shared hit=68521
+  ->  GroupAggregate  (cost=4029.79..7053.12 rows=1 width=141) (actual time=2050.073..2060.117 rows=4 loops=1)
+        Group Key: h.id, rt.id
+        Buffers: shared hit=68521
+        ->  Incremental Sort  (cost=4029.79..7053.09 rows=2 width=89) (actual time=2049.200..2059.237 rows=22 loops=1)
+              Sort Key: h.id, rt.id, r.room_number
+              Presorted Key: h.id, rt.id
+              Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 27kB  Peak Memory: 27kB
+              Buffers: shared hit=68521
+              ->  Nested Loop Anti Join  (cost=1006.57..7053.00 rows=1 width=89) (actual time=118.295..2058.736 rows=22 loops=1)
+                    Join Filter: (b.room_id = r.id)
+                    Rows Removed by Join Filter: 38622
+                    Buffers: shared hit=68521
+                    ->  Nested Loop  (cost=6.57..61.82 rows=1 width=89) (actual time=0.315..1.583 rows=30 loops=1)
+                          Buffers: shared hit=29
+                          ->  Merge Join  (cost=6.29..58.87 rows=1 width=85) (actual time=0.242..0.523 rows=5 loops=1)
+                                Merge Cond: (rt.hotel_id = h.id)
+                                Buffers: shared hit=12
+                                ->  Index Scan using uq_room_types_hotel_id_id on room_types rt  (cost=0.28..52.15 rows=278 width=29) (actual time=0.069..0.231 rows=184 loops=1)
+                                      Filter: (capacity >= 4)
+                                      Rows Removed by Filter: 346
+                                      Buffers: shared hit=9
+                                ->  Sort  (cost=6.01..6.01 rows=1 width=56) (actual time=0.158..0.183 rows=4 loops=1)
+                                      Sort Key: h.id
+                                      Sort Method: quicksort  Memory: 25kB
+                                      Buffers: shared hit=3
+                                      ->  Seq Scan on hotels h  (cost=0.00..6.00 rows=1 width=56) (actual time=0.040..0.118 rows=4 loops=1)
+                                            Filter: (lower((city)::text) = 'amritsar'::text)
+                                            Rows Removed by Filter: 196
+                                            Buffers: shared hit=3
+                          ->  Index Scan using uq_rooms_hotel_id_room_number on rooms r  (cost=0.29..2.94 rows=1 width=28) (actual time=0.048..0.161 rows=6 loops=5)
+                                Index Cond: (hotel_id = rt.hotel_id)
+                                Filter: (rt.id = room_type_id)
+                                Rows Removed by Filter: 41
+                                Buffers: shared hit=17
+                    ->  Gather  (cost=1000.00..6973.18 rows=1440 width=8) (actual time=8.193..66.592 rows=1288 loops=30)
+                          Workers Planned: 1
+                          Workers Launched: 1
+                          Buffers: shared hit=67813
+                          ->  Parallel Seq Scan on bookings b  (cost=0.00..5829.18 rows=847 width=8) (actual time=0.397..52.149 rows=650 loops=60)
+                                Filter: (((status)::text = ANY ('{held,confirmed}'::text[])) AND (daterange(check_in, check_out, '[)'::text) && '[2027-01-05,2027-01-07)'::daterange) AND (((status)::text = 'confirmed'::text) OR (hold_expires_at > now())))
+                                Rows Removed by Filter: 77232
+                                Buffers: shared hit=68492
+Planning:
+  Buffers: shared hit=190
+Planning Time: 7.662 ms
+Execution Time: 2060.667 ms

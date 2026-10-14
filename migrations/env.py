@@ -1,3 +1,4 @@
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -8,7 +9,9 @@ from app.models import Base
 
 config = context.config
 
-if config.config_file_name is not None:
+# Only when run from the alembic CLI: scripts and tests that migrate in-process keep their
+# own logging configuration.
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

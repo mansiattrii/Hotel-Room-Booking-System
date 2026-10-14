@@ -57,6 +57,20 @@ POST /api/v1/bookings/{id}/cancel
 `BOOKING_STRATEGY` selects how double booking is prevented: `constraint` (default),
 `pessimistic`, or `naive` (demonstration only; it double-books under concurrency).
 
+## Experiments
+
+Both scripts run only against `hotel_booking_test` (they truncate it, and drop the exclusion
+constraint while they run) and restore the production schema when they finish. Don't run
+them at the same time as the tests.
+
+```powershell
+python -m scripts.concurrency_test       # 100 simultaneous bookings of one room, per strategy
+python -m scripts.benchmark_search       # search latency and EXPLAIN plans, by index state
+```
+
+Output goes to `results/`: `concurrency.md`/`.csv`, `search_benchmark.md`/`.csv`, and the
+query plans in `results/explain/`.
+
 ## Tests and lint
 
 ```powershell

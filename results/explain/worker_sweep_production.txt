@@ -1,0 +1,24 @@
+Update on bookings  (cost=8.59..16.62 rows=0 width=0) (actual time=0.015..0.017 rows=0 loops=1)
+  Buffers: shared hit=1
+  ->  Nested Loop  (cost=8.59..16.62 rows=1 width=96) (actual time=0.015..0.016 rows=0 loops=1)
+        Buffers: shared hit=1
+        ->  HashAggregate  (cost=8.17..8.18 rows=1 width=40) (actual time=0.014..0.015 rows=0 loops=1)
+              Group Key: "ANY_subquery".id
+              Batches: 1  Memory Usage: 24kB
+              Buffers: shared hit=1
+              ->  Subquery Scan on "ANY_subquery"  (cost=0.13..8.17 rows=1 width=40) (actual time=0.013..0.013 rows=0 loops=1)
+                    Buffers: shared hit=1
+                    ->  Limit  (cost=0.13..8.16 rows=1 width=22) (actual time=0.012..0.012 rows=0 loops=1)
+                          Buffers: shared hit=1
+                          ->  LockRows  (cost=0.13..8.16 rows=1 width=22) (actual time=0.011..0.011 rows=0 loops=1)
+                                Buffers: shared hit=1
+                                ->  Index Scan using ix_bookings_held_expiry on bookings bookings_1  (cost=0.13..8.15 rows=1 width=22) (actual time=0.011..0.011 rows=0 loops=1)
+                                      Index Cond: (hold_expires_at <= now())
+                                      Filter: ((status)::text = 'held'::text)
+                                      Buffers: shared hit=1
+        ->  Index Scan using pk_bookings on bookings  (cost=0.42..8.44 rows=1 width=14) (never executed)
+              Index Cond: (id = "ANY_subquery".id)
+Planning:
+  Buffers: shared hit=13
+Planning Time: 0.489 ms
+Execution Time: 0.102 ms
