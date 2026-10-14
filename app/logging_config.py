@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 _STANDARD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {"message"}
+# uvicorn attaches a copy of each message with terminal colour codes; useless in JSON.
+_DROPPED_ATTRS = {"color_message"}
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
 class JsonFormatter(logging.Formatter):
@@ -20,7 +23,7 @@ class JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
         for key, value in record.__dict__.items():
-            if key not in _STANDARD_ATTRS:
+            if key not in _STANDARD_ATTRS and key not in _DROPPED_ATTRS:
                 payload[key] = value
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
@@ -28,9 +31,14 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str) -> None:
-    """Send all application logs to stderr as JSON lines."""
+    """Send all logs, including uvicorn's server and access logs, to stderr as JSON lines."""
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level.upper())
+    # uvicorn configures its loggers with plain-text handlers before it imports the app.
+    for name in _UVICORN_LOGGERS:
+        uvicorn_logger = logging.getLogger(name)
+        uvicorn_logger.handlers = []
+        uvicorn_logger.propagate = True

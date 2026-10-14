@@ -1,5 +1,14 @@
 name: hotel-booking
 
+# api, worker and migrate run the same image with different commands.
+x-app: &app
+  build: .
+  image: hotel-booking:latest
+  env_file: .env
+  environment:
+    # Inside the compose network the database is the "db" service, not the host port.
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
 services:
   db:
     image: postgres:16-alpine
@@ -8,7 +17,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
     ports:
-      - "${POSTGRES_HOST_PORT:-5434}:5432"
+      # Loopback only: reachable for local tests and tools, never from other machines.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5434}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
@@ -17,6 +27,55 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  nginx:
+    # 1.27.3+ for "resolve" on upstream servers (deploy/nginx.conf).
+    image: nginx:1.27.5-alpine
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

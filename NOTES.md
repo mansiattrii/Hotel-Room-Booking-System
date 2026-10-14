@@ -697,3 +697,180 @@ set only; the latency table is the one to quote.
   plus the pool; otherwise threads never run out.
 - **Why a partial index for the worker?** Its query only looks at held bookings, a tiny
   fraction of the table. Indexing only those keeps the index at 8 kB.
+
+---
+
+## Milestone 5: Production setup
+
+### What was built
+
+- `Dockerfile`: multi-stage, runs as an unprivileged user. One image serves the API, the
+  worker and the migration step; only the command differs.
+- `docker-compose.yml`: `db`, `migrate`, `api`, `worker`, `nginx`.
+- `deploy/nginx.conf`: reverse proxy in front of the API.
+- `.github/workflows/ci.yml`: lint, tests against PostgreSQL, Docker image build.
+- uvicorn's own server and access logs now go through the JSON formatter too
+  (`tests/test_logging_config.py`).
+
+### Why Docker, Nginx and CI at all
+
+- **Docker:** the same image runs on my laptop, in CI and on the server, with exact
+  dependency versions baked in. "Works on my machine" stops being a category of bug, and
+  deploying is "pull/build and start", not a list of manual install steps.
+- **Nginx:** the one public entry point. The API container isn't published on the host at
+  all, so nothing reaches uvicorn except through nginx. It's the place for things that
+  shouldn't live in application code: TLS termination (Milestone 6, optional), request size
+  limits, timeouts, and later rate limiting or serving several API replicas.
+- **CI:** every push proves that lint passes, the tests pass against a real PostgreSQL, and
+  the image builds. A broken commit is caught by a machine, not by whoever deploys next.
+
+### The image
+
+**Two stages.** The build stage creates a virtualenv and installs `requirements.txt` into
+it. The runtime stage starts again from the slim base and copies in only the virtualenv and
+the application code. pip and setuptools are uninstalled from the virtualenv before it's
+copied: nothing needs them at runtime.
+
+**Measured** (`docker image inspect`, Docker Desktop on this machine):
+
+| Image | Size |
+|---|---|
+| `python:3.11-slim-bookworm` base | 206,918,255 bytes (207 MB) |
+| Final multi-stage image | 338,569,124 bytes (339 MB) |
+| First multi-stage build, with pip and setuptools still in the venv | 375,588,772 bytes (376 MB) |
+| Same app, naive single stage (`pip install` in one `FROM`, runs as root) | 407,207,584 bytes (407 MB) |
+
+The single-stage image kept a 27 MB pip download cache in `/root/.cache/pip`. The
+virtualenv itself went from 126 MB to 98 MB after removing pip (17 MB) and setuptools
+(11 MB).
+
+**Honest framing:** every dependency here ships as a prebuilt wheel, so there's no compiler
+to leave behind, which is where multi-stage usually saves the most. Here it saves the pip
+cache and the install tooling, and keeps the runtime stage short and obvious. Most of the
+remaining size is the Python base image itself.
+
+**Non-root.** The container runs as `app` (uid 999, checked with `id`). If someone found a
+bug that let them run code in the API, they'd be an unprivileged user inside the container,
+not root.
+
+**`.dockerignore`** keeps `.env`, `.git`, `.venv`, tests and results out of the build
+context, so secrets can't end up in an image layer by accident.
+
+### Migrations: a one-off service, not on API startup
+
+`migrate` runs `alembic upgrade head` and exits. `api` and `worker` start only after `db`
+is healthy *and* `migrate` exited with code 0 (`service_completed_successfully`).
+
+- If a migration fails, the API doesn't start against a half-migrated schema; the
+  failure is visible as a non-zero exit on one container.
+- Running migrations inside every API process on startup breaks as soon as there are two
+  replicas: both try to migrate at once.
+- The same command works by hand on a server: `docker compose run --rm migrate`.
+
+### Compose details worth knowing
+
+- **Healthchecks gate startup.** `db` uses `pg_isready`; `api` calls its own `/health`
+  (which runs `SELECT 1`), with a Python one-liner because the slim image has no curl.
+  nginx starts only once the API is healthy.
+- **`DATABASE_URL` differs inside the stack.** On the host it's `127.0.0.1:5434`; inside the
+  compose network it's `db:5432`. Compose builds the in-stack URL from the `POSTGRES_*`
+  variables, so there's one source for the password. Consequence: the password must be
+  URL-safe.
+- **The database port is published on loopback only** (`127.0.0.1:5434`), so local tests
+  still work but other machines can't reach PostgreSQL. On a server this matters.
+- **Proxy headers.** uvicorn runs with `--proxy-headers --forwarded-allow-ips "*"`, so the
+  access log shows the client address nginx forwarded instead of nginx's. Trusting any
+  address is safe only because the API port isn't published; nginx is the only thing that
+  can reach it.
+- **Restart policy** `unless-stopped` on long-running services; `migrate` never restarts.
+
+### Bug found while testing: nginx 502 after the API container was recreated
+
+**Symptom:** after rebuilding the stack, `/health` through nginx returned 502 while the API
+container itself was healthy.
+
+**Cause:** nginx resolves `server api:8000` once, when it starts, and keeps that IP. The
+rebuild recreated the API container, which came back on a different IP (172.18.0.4 before,
+172.18.0.3 after). nginx's error log showed it still connecting to 172.18.0.4.
+
+**Fix:** use Docker's internal DNS server (`resolver 127.0.0.11 valid=10s`) and mark the
+upstream server `resolve`, so nginx looks the name up again. This needs nginx 1.27.3 or
+newer, so the image is pinned to `nginx:1.27.5-alpine`. Unlike the common
+`set $upstream ...; proxy_pass $upstream;` trick, it keeps the `upstream` block and its
+connection reuse (`keepalive`).
+
+**Verified:** recreated the API so it moved from 172.18.0.6 to 172.18.0.4 without restarting
+nginx. Of 15 requests at one per second, the first timed out against the old IP; the next
+14 returned 200.
+
+**What that first failure means:** for up to `valid=10s` after the API moves, nginx can
+still use the old address. With a single API container a redeploy has a short outage
+anyway; removing that needs two replicas and rolling restarts.
+
+### Smaller fix: uvicorn logs weren't JSON
+
+The app's logs were JSON lines, but uvicorn installs its own plain-text handlers before it
+imports the app, so its startup and access lines weren't. In a container all of these go to
+one stream, which a log tool would then have to parse two ways. `configure_logging` now
+removes uvicorn's handlers and lets its loggers propagate to the JSON handler. It also drops
+uvicorn's `color_message` field, a copy of the message with terminal colour codes.
+
+### CI
+
+Three jobs, in parallel:
+
+| Job | What it proves |
+|---|---|
+| lint | `ruff check` and `ruff format --check` pass |
+| test | all tests pass against a fresh `postgres:16-alpine` service container |
+| docker | the image builds, runs as non-root, and the app, worker and seed script import inside it |
+
+- The test job's database is created empty by the service container; the test fixtures
+  build the schema from the migrations, so CI also proves the migrations apply from scratch.
+- The secrets in `ci.yml` are throwaway values for a throwaway database that exists only
+  for that job. Real secrets would go in GitHub's encrypted secrets, never in the file.
+- `permissions: contents: read`: the workflow token can't push or change anything.
+- A newer push to the same branch cancels the older run (`concurrency`).
+
+**Verified locally** by reproducing the jobs: a fresh `postgres:16-alpine` container with
+the same settings as the workflow (155 passed), ruff clean, and the docker job's three steps.
+It has not run on GitHub yet: the repository has no remote.
+
+### End-to-end check through nginx
+
+With the full stack up, a script went through nginx on port 80: health 200, register 201,
+login 200, city availability 200, hold 201, the same request with the same
+`Idempotency-Key` 201 with `Idempotent-Replayed: true`, the same room with a new key 409,
+confirm 200 (`confirmed`), cancel 200 (`cancelled`), no token 401, unknown path 404.
+Every response carried `Server: nginx`, and port 8000 wasn't reachable from the host.
+
+### Alternatives rejected
+
+| Alternative | Why not |
+|---|---|
+| Single-stage image | Measured 407 MB vs 339 MB, ran as root, kept the pip cache. |
+| Alpine Python base | Uses musl instead of glibc. When a package has no musl wheel, pip compiles it from source and the build needs a compiler. Slim avoids that class of problem. |
+| Migrations on API startup | Races with more than one replica; a failed migration should stop the deploy, not crash-loop the API. |
+| Publishing the API port as well | Bypasses nginx, and makes trusting proxy headers unsafe. |
+| Restarting nginx after every API deploy | Fixes the symptom; re-resolving fixes the cause. |
+| Unpinned third-party images (`nginx:latest`) | A rebuild could silently pull a different major version. PostgreSQL is pinned to major 16 (a new major needs a data upgrade); nginx to 1.27.5, because the config depends on a 1.27.3+ feature. |
+
+### Likely questions
+
+- **Why multi-stage?** The runtime image gets only the virtualenv and code, not pip, its
+  cache or build tooling. Measured 339 MB vs 407 MB for a naive single stage. Honest caveat:
+  with only prebuilt wheels the saving is modest; most of the size is the Python base.
+- **Why non-root?** Limits what an attacker can do if they get code execution in the API.
+- **How do migrations run?** A one-off `migrate` service; the API and worker wait for it to
+  exit successfully.
+- **What does nginx do here that uvicorn can't?** One public entry point, request size
+  limits and timeouts now; TLS, rate limiting and load balancing across replicas later.
+  Application code stays free of those concerns.
+- **Why did nginx return 502?** It cached the API container's IP at startup. Fixed by
+  re-resolving through Docker's DNS.
+- **Is a deploy zero-downtime?** No: one API container, so a restart is a short outage.
+  Zero downtime needs at least two replicas and rolling restarts.
+- **How does CI test against PostgreSQL?** A service container; the tests rebuild the
+  schema from the migrations at the start of the run.
+- **Where would real secrets go?** GitHub encrypted secrets for CI; `.env` on the server
+  (never committed), or a secrets manager on AWS.

@@ -22,6 +22,43 @@ python -m uvicorn app.main:app --reload
 
 Health check: <http://localhost:8000/api/v1/health>. Interactive API docs: <http://localhost:8000/docs>
 
+## Full stack with Docker
+
+```powershell
+Copy-Item .env.example .env        # if not done already; edit the dummy values
+docker compose up -d --build --wait
+docker compose ps
+```
+
+| Service | What it runs |
+|---|---|
+| `db` | PostgreSQL 16, named volume, healthcheck; published on `127.0.0.1` only |
+| `migrate` | `alembic upgrade head` once, then exits; `api` and `worker` wait for it to succeed |
+| `api` | uvicorn on port 8000 inside the network (not published) |
+| `worker` | `python -m app.worker` |
+| `nginx` | reverse proxy, the only public entry point: port `HTTP_PORT` (default 80) |
+
+Health check through nginx: <http://localhost/api/v1/health>. API docs: <http://localhost/docs>
+
+Run the seed and admin scripts inside the stack:
+
+```powershell
+docker compose run --rm api python -m scripts.seed --hotels 20 --rooms 1000 --bookings 10000 --users 500
+docker compose run --rm api python -m scripts.create_admin --email admin@example.com
+```
+
+Logs (JSON lines) and shutdown:
+
+```powershell
+docker compose logs -f api worker
+docker compose down          # keeps the database volume
+docker compose down -v       # also deletes the database volume
+```
+
+`api`, `worker` and `migrate` use one image (`Dockerfile`: multi-stage, runs as a non-root
+user). Inside the stack they reach the database at `db:5432`; `docker-compose.yml` builds that
+`DATABASE_URL` from the `POSTGRES_*` values in `.env`, so the password must be URL-safe.
+
 ## Data and admin account
 
 ```powershell
@@ -81,6 +118,15 @@ python -m ruff format --check .
 
 Tests run against the `hotel_booking_test` database, which the db container creates on first
 start. They rebuild the schema from the migrations, so they never touch development data.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request, in three parallel jobs:
+
+- **lint:** `ruff check` and `ruff format --check`.
+- **test:** `pytest` against a PostgreSQL 16 service container.
+- **docker:** builds the image, checks it runs as a non-root user, and imports the app,
+  worker and seed script inside it.
 
 Render the migration SQL without a database:
 
