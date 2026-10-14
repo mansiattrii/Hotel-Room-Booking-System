@@ -1,0 +1,26 @@
+# Use AWS RDS instead of the db container (deploy/DEPLOY.md, optional RDS section):
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.rds.yml up -d --build --wait
+
+x-rds-database-url: &rds-database-url
+  DATABASE_URL: ${RDS_DATABASE_URL:?set RDS_DATABASE_URL in .env}
+
+services:
+  db:
+    # Only starts if this profile is requested explicitly, i.e. never in the RDS setup.
+    profiles: ["local-db"]
+
+  migrate:
+    environment: *rds-database-url
+    depends_on: !reset {}
+
+  api:
+    environment: *rds-database-url
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    environment: *rds-database-url
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully

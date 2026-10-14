@@ -834,7 +834,7 @@ Three jobs, in parallel:
 
 **Verified locally** by reproducing the jobs: a fresh `postgres:16-alpine` container with
 the same settings as the workflow (155 passed), ruff clean, and the docker job's three steps.
-It has not run on GitHub yet: the repository has no remote.
+After pushing to GitHub, the first run (commit `460e264`) passed all three jobs.
 
 ### End-to-end check through nginx
 
@@ -874,3 +874,136 @@ Every response carried `Server: nginx`, and port 8000 wasn't reachable from the 
   schema from the migrations at the start of the run.
 - **Where would real secrets go?** GitHub encrypted secrets for CI; `.env` on the server
   (never committed), or a secrets manager on AWS.
+
+---
+
+## Milestone 6: Deployment and write-up
+
+### What was built
+
+- `deploy/DEPLOY.md`: a step-by-step AWS guide: billing alert, key pair, EC2 instance and
+  security group, Docker install, `.env` with generated secrets, start, seed, verify, and
+  teardown. Optional sections for HTTPS and for moving PostgreSQL to RDS.
+- `deploy/docker-compose.rds.yml` and `deploy/docker-compose.https.yml`: compose override
+  files for the two optional setups, plus `deploy/nginx-https.conf`.
+- README rewritten: architecture, schema diagram, API summary, results, limitations.
+
+### How the guide was checked
+
+AWS itself wasn't touched (I don't have access to your account, and shouldn't). Everything
+else was run before being written down:
+
+| Step | How it was checked | Result |
+|---|---|---|
+| Docker install commands | Ran in a clean `ubuntu:24.04` container | Docker 29.9.1, Compose v5.6.0 |
+| Clone, `.env`, start | Fresh clone from GitHub, `.env` generated the way the guide does it, `APP_ENV=production` | All services up in 21 s (image already cached locally) |
+| Seed the smaller dataset | 20 hotels, 1,000 rooms, 10,000 bookings, 500 users | 1.0 s |
+| End-to-end flow | Smoke script through nginx | Every step returned the expected status |
+| Memory | `docker stats` after 200 concurrent city searches (all 200 returned 200) | nginx 16.79, api 76.59, worker 55.16, db 72.4 MiB: about 221 MiB in total |
+| RDS override | A separate PostgreSQL 16 container standing in for RDS | No `db` container started; migrations reached `0003`; `btree_gist` installed; `/health` 200 |
+| HTTPS config | `nginx -t` with a self-signed certificate in Let's Encrypt's layout | Syntax OK |
+
+Not checked: the AWS console steps, and issuing a real certificate (needs a domain).
+
+### Decisions in the guide
+
+- **Billing alert before anything else.** A zero spend budget emails at the first cent. It's
+  the cheapest insurance against a forgotten resource.
+- **`t3.micro` works.** The memory measurement above is why: about 221 MiB for all four
+  containers leaves room on 1 GiB. Swap covers the image build. `t3.small` is offered for
+  accounts on the newer free plan, for more margin.
+- **SSH from my IP only; 5432 never open.** PostgreSQL is published on the instance's
+  loopback interface, and the security group has no rule for it anyway. Two independent
+  layers.
+- **Secrets are generated on the server** (`secrets.token_urlsafe`) and never typed into a
+  chat, a commit or a screenshot. URL-safe because compose builds the database URL from
+  the password.
+- **Terminate, don't stop.** A stopped instance still bills for its disk, and an Elastic
+  IP bills while allocated. The teardown section lists each thing that can keep billing.
+- **RDS security group references the EC2 security group**, not an IP range, so only that
+  instance can connect, whatever its IP. `sslmode=require` refuses unencrypted connections.
+- **Seeded users are deliberate demo accounts** with a known password, so a recruiter can
+  log in and try a booking. The admin account is created with your own password.
+
+### How the system would scale further
+
+The order matters: measure first, then fix the actual bottleneck. Today a single
+PostgreSQL handles the seeded data with search medians under 7 ms.
+
+**1. More API replicas behind nginx.** The API keeps no state between requests (JWTs,
+sessions per request), so replicas are easy: nginx already uses an `upstream` block. The
+constraint: total connections = replicas × (pool size + overflow), and PostgreSQL has a
+connection limit. Past a few replicas, put PgBouncer (a connection pooler) in front of the
+database.
+
+**2. Read replicas for search.** Availability searches are reads and the bulk of traffic,
+so they can go to a streaming replica. The catch is **replication lag**: a replica can show
+a room as free that was booked a moment ago on the primary. That's acceptable here because
+the booking itself always runs on the primary, where the exclusion constraint has the
+final say. The worst case is "room was shown as available, booking returns 409", which the
+API already handles. Bookings, confirm and cancel must never read from a replica.
+
+**3. Caching search results.** City searches for the same dates repeat. A short-lived cache
+(Redis, keyed by city, dates and party size, expiring in seconds) would absorb repeated
+searches. Same reasoning as replicas: a stale "available" is acceptable because the
+constraint decides at booking time; a stale result must never be used to decide a booking.
+Invalidation can stay simple: a short expiry rather than trying to invalidate on every
+booking.
+
+**4. Partitioning bookings: tested, and the obvious version breaks the guarantee.**
+Partitioning by date looks natural (old bookings in old partitions), but I tested it on
+PostgreSQL 16.15 and 17.11:
+
+| Approach | PostgreSQL 16 | PostgreSQL 17 |
+|---|---|---|
+| Partition by `check_in` (range), exclusion constraint on the parent | Rejected: "exclusion constraints are not supported on partitioned tables" | Rejected: the constraint must include the partition key column `check_in` |
+| Same, a separate exclusion constraint on each partition | Accepted, **and double-books**: a 30 Dec–3 Jan stay and a 1–2 Jan stay for the same room both inserted (they're in different partitions) | Same: both inserted |
+| Partition by hash of `room_id`, exclusion constraint on the parent | Rejected | **Works**: the overlapping insert was rejected |
+
+So:
+- On PostgreSQL 16 (this project), partitioning `bookings` means giving up the database
+  guarantee. Not worth it at this size.
+- On PostgreSQL 17, partitioning by `room_id` keeps the guarantee, because every overlap
+  check compares bookings of one room, and all of one room's bookings are in one partition.
+  But it doesn't give the main benefit of date partitioning: dropping or archiving old
+  bookings by detaching a partition.
+- The practical alternative for old data: move bookings whose stay ended long ago into an
+  archive table in batches, so the live table stays small. That's safe for the guarantee:
+  a new booking can't start in the past, so it can never overlap a stay that has already
+  ended.
+
+**5. If one database is truly not enough:** shard by hotel or region. Every booking
+involves exactly one room, and a room belongs to one hotel, so a booking never needs two
+shards. Each shard keeps its own exclusion constraint. City search across shards would need
+a separate search index. This is far beyond what the project needs; it's the answer to
+"and after that?".
+
+### Alternatives rejected
+
+| Alternative | Why not |
+|---|---|
+| Kubernetes / ECS for the deployment | A single-instance demo doesn't need an orchestrator; compose is the same model on one machine and easy to explain. |
+| RDS as the default | Costs more and adds steps; the guide offers it as an optional, explained change. |
+| Opening 5432 to my IP for database access | SSH tunnelling (`ssh -L`) gives the same access without exposing PostgreSQL at all. |
+| Partitioning bookings by date | Breaks the exclusion constraint (tested above). |
+| Caching inside the API process | Each replica would have its own cache; a shared cache (Redis) is consistent across replicas. |
+
+### Likely questions
+
+- **How is it deployed?** One EC2 instance running the compose stack; nginx on port 80 is
+  the only public entry point; secrets live in a `.env` generated on the server.
+- **Why is a 1 GiB instance enough?** Measured: about 221 MiB for all four containers after
+  200 concurrent searches, with the smaller dataset. Swap covers the image build.
+- **How would you scale reads?** Read replicas or a short-lived cache for search, accepting
+  slightly stale availability, because the booking on the primary is protected by the
+  constraint.
+- **Would you partition the bookings table?** Not by date: tested, PostgreSQL rejects the
+  constraint on the partitioned table, and per-partition constraints miss overlaps across a
+  boundary. Hash partitioning by `room_id` works on PostgreSQL 17 but not 16.
+- **What changes with RDS?** One connection string (`RDS_DATABASE_URL`, with
+  `sslmode=require`), a security group that only admits the EC2 instance's group, and cost.
+- **How do you avoid a surprise AWS bill?** Zero spend budget before launching anything,
+  free tier eligible types only, terminate rather than stop, release Elastic IPs, and check
+  EC2 Global View for other regions.
+- **What are the limitations?** See the README: one API container, mocked payments, minimal
+  auth, offset pagination, PostgreSQL-specific constraint, laptop-only measurements.
